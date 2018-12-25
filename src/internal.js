@@ -20,10 +20,23 @@ export const camelCase = input =>
 export const repeatString = (str, times) =>
   str.repeat ? str.repeat(times) : new Array(times + 1).join(str);
 
-export async function createPaymentMessage(client, asset, outputs, address) {
+export async function createPaymentMessage(client, asset, arrOutputs, address, signerAddress) {
+  let inputs = [];
+  let outputs = arrOutputs;
   const amount = outputs.reduce((a, b) => a + b.amount, 0);
 
-  const targetAmount = asset ? amount : 1000 + amount;
+  if (signerAddress) {
+    const coinsForTxFee = await client.api.pickDivisibleCoinsForAmount({
+      addresses: [signerAddress],
+      last_ball_mci: 1000000000000000,
+      amount: 1000,
+      spend_unconfirmed: 'own',
+    });
+    inputs = [...coinsForTxFee.inputs_with_proofs.map(input => input.input), ...inputs];
+    outputs = [{ address: signerAddress, amount: coinsForTxFee.total_amount }, ...outputs];
+  }
+
+  const targetAmount = asset || signerAddress ? amount : 1000 + amount;
   const coinsForAmount = await client.api.pickDivisibleCoinsForAmount({
     addresses: [address],
     last_ball_mci: 1000000000000000,
@@ -32,25 +45,20 @@ export async function createPaymentMessage(client, asset, outputs, address) {
     asset,
   });
 
-  const inputs = coinsForAmount.inputs_with_proofs.map(input => input.input);
+  inputs = [...inputs, ...coinsForAmount.inputs_with_proofs.map(input => input.input)];
+  outputs = [...outputs, { address, amount: coinsForAmount.total_amount - amount }];
 
-  const payload = {
-    inputs,
-    outputs: [{ address, amount: coinsForAmount.total_amount - amount }, ...outputs],
-  };
-
+  const payload = { inputs, outputs };
   if (asset) {
     payload.asset = asset;
   }
 
-  const payment = {
+  return {
     app: 'payment',
     payload_hash: '--------------------------------------------',
     payload_location: 'inline',
     payload,
   };
-
-  return payment;
 }
 
 export function sortOutputs(a, b) {

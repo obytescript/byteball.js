@@ -43,22 +43,19 @@ export default class Client {
             : { ...self.options, wif: options };
         const privKeyBuf = fromWif(conf.wif, conf.testnet).privateKey;
         const pubkey = toPublicKey(privKeyBuf);
-        const definition = conf.definition || ['sig', { pubkey }];
+        const signerDefinition = ['sig', { pubkey }];
+        const signerAddress = getChash160(signerDefinition);
+        const definition = conf.definition || signerDefinition;
         const address = conf.address || getChash160(definition);
         const path = conf.path || 'r';
-
-        const witnesses = await self.getCachedWitnesses();
-
-        const [lightProps, currentDefinition] = await Promise.all([
-          self.api.getParentsAndLastBallAndWitnessListUnit({ witnesses }),
-          self.api.getDefinition(address),
-        ]);
+        const isMultiAuthored = signerAddress !== address;
 
         const bytePayment = await createPaymentMessage(
           self,
           null,
           app !== 'payment' || payload.asset ? [] : payload.outputs,
           address,
+          isMultiAuthored ? signerAddress : null,
         );
         const customMessages = [bytePayment];
 
@@ -81,6 +78,13 @@ export default class Client {
           });
         }
 
+        const witnesses = await self.getCachedWitnesses();
+        const [lightProps, networkDefinition, signerNetworkDefinition] = await Promise.all([
+          self.api.getParentsAndLastBallAndWitnessListUnit({ witnesses }),
+          self.api.getDefinition(address),
+          isMultiAuthored ? self.api.getDefinition(signerAddress) : null,
+        ]);
+
         const unit = {
           version: conf.testnet ? VERSION_TESTNET : VERSION,
           alt: conf.testnet ? ALT_TESTNET : ALT,
@@ -92,27 +96,32 @@ export default class Client {
           witness_list_unit: lightProps.witness_list_unit,
         };
 
-        const author = { address, authentifiers: {} };
-        if (!currentDefinition) {
-          author.definition = definition;
+        unit.authors.push({
+          address,
+          authentifiers: { r: repeatString('-', 88) },
+          definition: !networkDefinition ? definition : undefined,
+        });
+
+        if (isMultiAuthored) {
+          unit.authors.push({
+            address: signerAddress,
+            authentifiers: { r: repeatString('-', 88) },
+            definition: !signerNetworkDefinition ? signerDefinition : undefined,
+          });
+
+          unit.earned_headers_commission_recipients = [
+            {
+              address: signerAddress,
+              earned_headers_commission_share: 100,
+            },
+          ];
         }
 
-        const assocSigningPaths = {};
-        const assocLengthsBySigningPaths = { r: 88 };
-        const arrSigningPaths = Object.keys(assocLengthsBySigningPaths);
-        assocSigningPaths[address] = arrSigningPaths;
-        for (let j = 0; j < arrSigningPaths.length; j += 1) {
-          author.authentifiers[arrSigningPaths[j]] = repeatString(
-            '-',
-            assocLengthsBySigningPaths[arrSigningPaths[j]],
-          );
-        }
-        unit.authors.push(author);
+        unit.headers_commission = getHeadersSize(unit);
+        unit.payload_commission = getTotalPayloadSize(unit);
 
-        const headersCommission = getHeadersSize(unit);
-        const payloadCommission = getTotalPayloadSize(unit);
-
-        customMessages[0].payload.outputs[0].amount -= headersCommission + payloadCommission;
+        customMessages[0].payload.outputs[0].amount -=
+          unit.headers_commission + unit.payload_commission;
         customMessages[0].payload.outputs.sort(sortOutputs);
         customMessages[0].payload_hash = getBase64Hash(customMessages[0].payload);
 
@@ -121,12 +130,13 @@ export default class Client {
           customMessages[1].payload_hash = getBase64Hash(customMessages[1].payload);
         }
 
-        unit.headers_commission = headersCommission;
-        unit.payload_commission = payloadCommission;
-
         const textToSign = getUnitHashToSign(unit);
+        const signature = sign(textToSign, privKeyBuf);
         unit.authors[0].authentifiers = {};
-        unit.authors[0].authentifiers[path] = sign(textToSign, privKeyBuf);
+        unit.authors[0].authentifiers[path] = signature;
+        if (isMultiAuthored) {
+          unit.authors[1].authentifiers = { r: signature };
+        }
 
         unit.messages = [...customMessages];
         unit.unit = getUnitHash(unit);
